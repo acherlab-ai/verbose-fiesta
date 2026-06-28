@@ -101,7 +101,7 @@ jobs:
           if ($termService.Status -eq 'Running') { Write-Host "│ ✅ TermService đang chạy" -ForegroundColor Green } else { Write-Host "│ ❌ TermService không chạy" -ForegroundColor Red }
           Write-Host "🎯 Kiểm tra hoàn tất!" -ForegroundColor Green
 
-      # FRP TUNNEL - LẤY PORT RANDOM CHÍNH XÁC
+      # FRP TUNNEL - FIX: CHẠY BẰNG JOB VÀ GIỮ PROCESS SỐNG
       - name: 🌐 THIẾT LẬP FRP
         run: |
           Write-Host ""
@@ -129,7 +129,7 @@ jobs:
               Write-Host "`r│ ❌ Lỗi giải nén: $($_.Exception.Message)" -ForegroundColor Red
               exit 1
           }
-          # Tạo frpc.toml với remotePort = 0
+          # Tạo frpc.toml
           $configPath = "$frpDir\frpc.toml"
           $configContent = @"
           serverAddr = "103.82.195.149"
@@ -147,29 +147,62 @@ jobs:
           $configContent | Set-Content -Path $configPath -Encoding UTF8
           Write-Host "│ ✅ Đã tạo frpc.toml" -ForegroundColor Green
 
-          # Khởi động frpc, ghi log
-          Write-Host "│ 🚀 Khởi động frpc..." -NoNewline -ForegroundColor Blue
+          # Chạy frpc trong một job để đảm bảo process sống lâu
           $logFile = "$env:TEMP\frpc.log"
           $errFile = "$env:TEMP\frpc.err"
-          $process = Start-Process -FilePath "$frpDir\frpc.exe" -ArgumentList "-c `"$configPath`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $errFile
-          # Chờ 5 giây để kết nối và ghi log
-          Start-Sleep -Seconds 5
-          if ($process.HasExited) {
-              Write-Host "`r│ ❌ FRPC thoát sớm (mã $($process.ExitCode))" -ForegroundColor Red
-              if (Test-Path $errFile) { Get-Content $errFile | ForEach-Object { Write-Host "│ Lỗi: $_" -ForegroundColor Red } }
-              exit 1
+          # Xóa log cũ
+          Remove-Item $logFile -ErrorAction SilentlyContinue
+          Remove-Item $errFile -ErrorAction SilentlyContinue
+
+          # Tạo script block để chạy frpc và redirect
+          $jobScript = {
+              param($frpExe, $cfg, $log, $err)
+              & $frpExe -c $cfg 2> $err > $log
+          }
+          $job = Start-Job -ScriptBlock $jobScript -ArgumentList "$frpDir\frpc.exe", $configPath, $logFile, $errFile
+          # Lưu PID của job (thực tế là PID của process bên trong)
+          # Chờ vài giây để process khởi tạo
+          Start-Sleep -Seconds 8
+
+          # Kiểm tra xem job còn sống không
+          if ($job.State -eq 'Running') {
+              # Lấy PID thực từ job (nếu có)
+              $childJob = Get-Job -Id $job.Id
+              $pidOfFrpc = $null
+              # Thử lấy PID từ output của job? Không, nhưng ta có thể dùng Get-Process để tìm frpc.exe
+              $frpcProcess = Get-Process -Name "frpc" -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-1) }
+              if ($frpcProcess) {
+                  $pidOfFrpc = $frpcProcess.Id
+                  Write-Host "│ ✅ FRP đang chạy (PID: $pidOfFrpc)" -ForegroundColor Green
+              } else {
+                  Write-Host "│ ⚠️  Không tìm thấy process frpc, nhưng job vẫn chạy" -ForegroundColor Yellow
+              }
+              # Lưu PID vào env (nếu có)
+              if ($pidOfFrpc) {
+                  echo "FRP_PID=$pidOfFrpc" >> $env:GITHUB_ENV
+              } else {
+                  # Lưu ID job để sau kill
+                  echo "FRP_JOB_ID=$($job.Id)" >> $env:GITHUB_ENV
+              }
           } else {
-              Write-Host "`r│ ✅ FRP Tunnel đang chạy (PID: $($process.Id))" -ForegroundColor Green
-              echo "FRP_PID=$($process.Id)" >> $env:GITHUB_ENV
+              Write-Host "│ ❌ FRP job đã dừng (State: $($job.State))" -ForegroundColor Red
+              # Lấy lỗi từ file
+              if (Test-Path $errFile) {
+                  $errContent = Get-Content $errFile -ErrorAction SilentlyContinue
+                  Write-Host "│ Lỗi: $errContent" -ForegroundColor Red
+              }
+              if (Test-Path $logFile) {
+                  $logContent = Get-Content $logFile -ErrorAction SilentlyContinue
+                  Write-Host "│ Log: $logContent" -ForegroundColor Gray
+              }
+              exit 1
           }
 
-          # --- LẤY PORT TỪ LOG ---
+          # Lấy port từ log
           Write-Host "│ 🔍 Đang lấy cổng được cấp..." -NoNewline -ForegroundColor Blue
-          $remotePort = $null
-          # Chờ thêm để log đầy đủ
           Start-Sleep -Seconds 3
           $logContent = Get-Content $logFile -ErrorAction SilentlyContinue
-          # Thử nhiều pattern
+          $remotePort = $null
           $patterns = @(
               'remote port\s+(\d+)',
               'port\s+(\d+)\s+\[rdp-acherlab\]',
@@ -185,7 +218,7 @@ jobs:
               }
           }
           if (-not $remotePort) {
-              # Thử lấy từ dòng cuối cùng có chứa số
+              # Thử lấy số cuối cùng trong log
               $lastNumbers = $logContent -match '\d+' | ForEach-Object { [regex]::Match($_, '\d+').Value } | Select-Object -Last 1
               if ($lastNumbers) {
                   $remotePort = $lastNumbers
@@ -195,7 +228,6 @@ jobs:
                   $remotePort = "45000"
               }
           }
-          # Lưu vào env
           echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
           echo "FRP_DOMAIN=rdp.acherlab.xyz" >> $env:GITHUB_ENV
 
@@ -241,6 +273,7 @@ jobs:
           $matKhau = Get-Content $env:TEMP\rdp_password.txt -ErrorAction SilentlyContinue
           $totalMinutes = $env:TOTAL_MINUTES
           $frpPid = $env:FRP_PID
+          $frpJobId = $env:FRP_JOB_ID
           $remotePort = $env:FRP_PORT
           $domain = $env:FRP_DOMAIN
           $timeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("SE Asia Standard Time")
@@ -254,7 +287,7 @@ jobs:
           Write-Host "🕐 Kết thúc: $($thoiGianKetThuc.ToString('HH:mm:ss'))" -ForegroundColor Green
           Write-Host ""
           $monitorScript = {
-              param($frpPid)
+              param($frpPid, $frpJobId)
               $lastLogTime = Get-Date
               while ($true) {
                   $currentTime = Get-Date
@@ -262,7 +295,12 @@ jobs:
                       $termService = Get-Service -Name TermService -ErrorAction SilentlyContinue
                       $rdpConnections = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Where-Object {$_.State -eq 'Established'}
                       $frpcRunning = $false
-                      try { $frpcProcess = Get-Process -Id $frpPid -ErrorAction SilentlyContinue; $frpcRunning = ($frpcProcess -ne $null -and -not $frpcProcess.HasExited) } catch {}
+                      if ($frpPid) {
+                          try { $frpcProcess = Get-Process -Id $frpPid -ErrorAction SilentlyContinue; $frpcRunning = ($frpcProcess -ne $null -and -not $frpcProcess.HasExited) } catch {}
+                      } elseif ($frpJobId) {
+                          $job = Get-Job -Id $frpJobId -ErrorAction SilentlyContinue
+                          if ($job -and $job.State -eq 'Running') { $frpcRunning = $true }
+                      }
                       Write-Host "[$($currentTime.ToString('HH:mm:ss'))] 📊 RDP: $($termService.Status), Kết nối: $($rdpConnections.Count), FRP: $(if($frpcRunning){'Running'}else{'Stopped'})" -ForegroundColor Blue
                       $lastLogTime = $currentTime
                   }
@@ -271,7 +309,7 @@ jobs:
                   Start-Sleep -Seconds 30
               }
           }
-          Start-Job -ScriptBlock $monitorScript -ArgumentList $frpPid -Name "Monitor"
+          Start-Job -ScriptBlock $monitorScript -ArgumentList $frpPid, $frpJobId -Name "Monitor"
           $frames = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
           $colors = @('Red', 'Yellow', 'Green', 'Cyan', 'Blue', 'Magenta')
           $startTime = Get-Date
@@ -297,7 +335,11 @@ jobs:
           Write-Host ""
           Write-Host "🧹 DỌN DẸP..." -ForegroundColor Yellow
           $frpPid = $env:FRP_PID
-          if ($frpPid) { try { Stop-Process -Id $frpPid -Force -ErrorAction SilentlyContinue; Write-Host "│ ✅ Đã dừng frpc" -ForegroundColor Green } catch { Write-Host "│ ⚠️  Không dừng được frpc" -ForegroundColor Yellow } }
+          $frpJobId = $env:FRP_JOB_ID
+          if ($frpPid) { try { Stop-Process -Id $frpPid -Force -ErrorAction SilentlyContinue; Write-Host "│ ✅ Đã dừng frpc (PID)" -ForegroundColor Green } catch { Write-Host "│ ⚠️  Không dừng được PID" -ForegroundColor Yellow } }
+          if ($frpJobId) {
+              try { Stop-Job -Id $frpJobId -ErrorAction SilentlyContinue; Remove-Job -Id $frpJobId -Force -ErrorAction SilentlyContinue; Write-Host "│ ✅ Đã dừng job frpc" -ForegroundColor Green } catch { Write-Host "│ ⚠️  Không dừng được job" -ForegroundColor Yellow }
+          }
           Remove-Item "$env:TEMP\rdp_password.txt" -ErrorAction SilentlyContinue
           Remove-Item "$env:TEMP\frpc" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:TEMP\frpc.log" -ErrorAction SilentlyContinue
