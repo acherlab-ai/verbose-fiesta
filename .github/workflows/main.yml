@@ -101,7 +101,7 @@ jobs:
           if ($termService.Status -eq 'Running') { Write-Host "│ ✅ TermService đang chạy" -ForegroundColor Green } else { Write-Host "│ ❌ TermService không chạy" -ForegroundColor Red }
           Write-Host "🎯 Kiểm tra hoàn tất!" -ForegroundColor Green
 
-      # FRP TUNNEL - FIXED SYNTAX & RANDOM PORT
+      # FRP TUNNEL - LẤY PORT RANDOM CHÍNH XÁC
       - name: 🌐 THIẾT LẬP FRP
         run: |
           Write-Host ""
@@ -129,7 +129,7 @@ jobs:
               Write-Host "`r│ ❌ Lỗi giải nén: $($_.Exception.Message)" -ForegroundColor Red
               exit 1
           }
-          # Tạo file cấu hình frpc.toml (sử dụng heredoc an toàn)
+          # Tạo frpc.toml với remotePort = 0
           $configPath = "$frpDir\frpc.toml"
           $configContent = @"
           serverAddr = "103.82.195.149"
@@ -147,43 +147,56 @@ jobs:
           $configContent | Set-Content -Path $configPath -Encoding UTF8
           Write-Host "│ ✅ Đã tạo frpc.toml" -ForegroundColor Green
 
-          # Khởi động frpc, ghi log để lấy port random
+          # Khởi động frpc, ghi log
           Write-Host "│ 🚀 Khởi động frpc..." -NoNewline -ForegroundColor Blue
           $logFile = "$env:TEMP\frpc.log"
           $errFile = "$env:TEMP\frpc.err"
           $process = Start-Process -FilePath "$frpDir\frpc.exe" -ArgumentList "-c `"$configPath`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $errFile
-          Start-Sleep -Seconds 8
+          # Chờ 5 giây để kết nối và ghi log
+          Start-Sleep -Seconds 5
           if ($process.HasExited) {
-              Write-Host "`r│ ❌ FRPC thoát với mã $($process.ExitCode)" -ForegroundColor Red
+              Write-Host "`r│ ❌ FRPC thoát sớm (mã $($process.ExitCode))" -ForegroundColor Red
               if (Test-Path $errFile) { Get-Content $errFile | ForEach-Object { Write-Host "│ Lỗi: $_" -ForegroundColor Red } }
-              if (Test-Path $logFile) { Get-Content $logFile | ForEach-Object { Write-Host "│ Output: $_" -ForegroundColor Gray } }
               exit 1
           } else {
               Write-Host "`r│ ✅ FRP Tunnel đang chạy (PID: $($process.Id))" -ForegroundColor Green
               echo "FRP_PID=$($process.Id)" >> $env:GITHUB_ENV
           }
-          # Lấy port từ log
+
+          # --- LẤY PORT TỪ LOG ---
           Write-Host "│ 🔍 Đang lấy cổng được cấp..." -NoNewline -ForegroundColor Blue
-          Start-Sleep -Seconds 2
+          $remotePort = $null
+          # Chờ thêm để log đầy đủ
+          Start-Sleep -Seconds 3
           $logContent = Get-Content $logFile -ErrorAction SilentlyContinue
-          $portMatch = $logContent | Select-String -Pattern 'remote port\s+(\d+)' -CaseSensitive:$false
-          if ($portMatch) {
-              $remotePort = $portMatch.Matches.Groups[1].Value
-              Write-Host "`r│ ✅ Cổng được cấp: $remotePort" -ForegroundColor Green
-              echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
-          } else {
-              # Thử tìm dòng khác
-              $portMatch2 = $logContent | Select-String -Pattern 'start proxy success.*port\s+(\d+)' -CaseSensitive:$false
-              if ($portMatch2) {
-                  $remotePort = $portMatch2.Matches.Groups[1].Value
+          # Thử nhiều pattern
+          $patterns = @(
+              'remote port\s+(\d+)',
+              'port\s+(\d+)\s+\[rdp-acherlab\]',
+              'start proxy success.*port\s+(\d+)',
+              'listening on\s+(\d+)'
+          )
+          foreach ($pattern in $patterns) {
+              $match = $logContent | Select-String -Pattern $pattern -CaseSensitive:$false
+              if ($match) {
+                  $remotePort = $match.Matches.Groups[1].Value
                   Write-Host "`r│ ✅ Cổng được cấp: $remotePort" -ForegroundColor Green
-                  echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
-              } else {
-                  Write-Host "`r│ ⚠️  Không tìm thấy cổng trong log, sử dụng mặc định 45000" -ForegroundColor Yellow
-                  $remotePort = "45000"
-                  echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
+                  break
               }
           }
+          if (-not $remotePort) {
+              # Thử lấy từ dòng cuối cùng có chứa số
+              $lastNumbers = $logContent -match '\d+' | ForEach-Object { [regex]::Match($_, '\d+').Value } | Select-Object -Last 1
+              if ($lastNumbers) {
+                  $remotePort = $lastNumbers
+                  Write-Host "`r│ ⚠️  Dùng số cuối cùng trong log: $remotePort" -ForegroundColor Yellow
+              } else {
+                  Write-Host "`r│ ❌ Không tìm thấy cổng, dùng mặc định 45000 (có thể sai)" -ForegroundColor Red
+                  $remotePort = "45000"
+              }
+          }
+          # Lưu vào env
+          echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
           echo "FRP_DOMAIN=rdp.acherlab.xyz" >> $env:GITHUB_ENV
 
       # THÔNG TIN KẾT NỐI
