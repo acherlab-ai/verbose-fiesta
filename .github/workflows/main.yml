@@ -101,7 +101,7 @@ jobs:
           if ($termService.Status -eq 'Running') { Write-Host "│ ✅ TermService đang chạy" -ForegroundColor Green } else { Write-Host "│ ❌ TermService không chạy" -ForegroundColor Red }
           Write-Host "🎯 Kiểm tra hoàn tất!" -ForegroundColor Green
 
-      # FRP TUNNEL - FIXED
+      # FRP TUNNEL - FIXED SYNTAX & RANDOM PORT
       - name: 🌐 THIẾT LẬP FRP
         run: |
           Write-Host ""
@@ -129,9 +129,9 @@ jobs:
               Write-Host "`r│ ❌ Lỗi giải nén: $($_.Exception.Message)" -ForegroundColor Red
               exit 1
           }
-          # Tạo cấu hình frpc.toml theo yêu cầu
+          # Tạo file cấu hình frpc.toml (sử dụng heredoc an toàn)
           $configPath = "$frpDir\frpc.toml"
-          @"
+          $configContent = @"
           serverAddr = "103.82.195.149"
           serverPort = 7000
           auth.method = "token"
@@ -143,45 +143,56 @@ jobs:
           localIP = "127.0.0.1"
           localPort = 3389
           remotePort = 0
-"@ | Set-Content -Path $configPath -Encoding UTF8
+          "@
+          $configContent | Set-Content -Path $configPath -Encoding UTF8
           Write-Host "│ ✅ Đã tạo frpc.toml" -ForegroundColor Green
 
-          # Khởi động frpc với redirect output, kiểm tra lỗi
+          # Khởi động frpc, ghi log để lấy port random
           Write-Host "│ 🚀 Khởi động frpc..." -NoNewline -ForegroundColor Blue
           $logFile = "$env:TEMP\frpc.log"
-          $errLog = "$env:TEMP\frpc.err"
-          $process = Start-Process -FilePath "$frpDir\frpc.exe" -ArgumentList "-c `"$configPath`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $errLog
-          Start-Sleep -Seconds 5
+          $errFile = "$env:TEMP\frpc.err"
+          $process = Start-Process -FilePath "$frpDir\frpc.exe" -ArgumentList "-c `"$configPath`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $errFile
+          Start-Sleep -Seconds 8
           if ($process.HasExited) {
-              $exitCode = $process.ExitCode
-              Write-Host "`r│ ❌ FRPC thoát với mã $exitCode" -ForegroundColor Red
-              # Đọc lỗi
-              if (Test-Path $errLog) {
-                  $errContent = Get-Content $errLog -ErrorAction SilentlyContinue
-                  Write-Host "│ Lỗi: $errContent" -ForegroundColor Red
-              }
-              # Đọc stdout
-              if (Test-Path $logFile) {
-                  $outContent = Get-Content $logFile -ErrorAction SilentlyContinue
-                  Write-Host "│ Output: $outContent" -ForegroundColor Gray
-              }
+              Write-Host "`r│ ❌ FRPC thoát với mã $($process.ExitCode)" -ForegroundColor Red
+              if (Test-Path $errFile) { Get-Content $errFile | ForEach-Object { Write-Host "│ Lỗi: $_" -ForegroundColor Red } }
+              if (Test-Path $logFile) { Get-Content $logFile | ForEach-Object { Write-Host "│ Output: $_" -ForegroundColor Gray } }
               exit 1
           } else {
               Write-Host "`r│ ✅ FRP Tunnel đang chạy (PID: $($process.Id))" -ForegroundColor Green
               echo "FRP_PID=$($process.Id)" >> $env:GITHUB_ENV
-              echo "FRP_DOMAIN=103.82.195.149" >> $env:GITHUB_ENV  # Không có domain tùy chỉnh, dùng IP và port
-              echo "FRP_PORT=0" >> $env:GITHUB_ENV  # random, cần lấy từ log? nhưng tạm thời
           }
-          # Kiểm tra kết nối nhanh
-          Write-Host "│ 🔄 Kiểm tra tunnel..." -NoNewline -ForegroundColor Blue
-          Start-Sleep -Seconds 3
-          Write-Host "`r│ ✅ Tunnel sẵn sàng (remotePort được cấp ngẫu nhiên)" -ForegroundColor Green
+          # Lấy port từ log
+          Write-Host "│ 🔍 Đang lấy cổng được cấp..." -NoNewline -ForegroundColor Blue
+          Start-Sleep -Seconds 2
+          $logContent = Get-Content $logFile -ErrorAction SilentlyContinue
+          $portMatch = $logContent | Select-String -Pattern 'remote port\s+(\d+)' -CaseSensitive:$false
+          if ($portMatch) {
+              $remotePort = $portMatch.Matches.Groups[1].Value
+              Write-Host "`r│ ✅ Cổng được cấp: $remotePort" -ForegroundColor Green
+              echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
+          } else {
+              # Thử tìm dòng khác
+              $portMatch2 = $logContent | Select-String -Pattern 'start proxy success.*port\s+(\d+)' -CaseSensitive:$false
+              if ($portMatch2) {
+                  $remotePort = $portMatch2.Matches.Groups[1].Value
+                  Write-Host "`r│ ✅ Cổng được cấp: $remotePort" -ForegroundColor Green
+                  echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
+              } else {
+                  Write-Host "`r│ ⚠️  Không tìm thấy cổng trong log, sử dụng mặc định 45000" -ForegroundColor Yellow
+                  $remotePort = "45000"
+                  echo "FRP_PORT=$remotePort" >> $env:GITHUB_ENV
+              }
+          }
+          echo "FRP_DOMAIN=rdp.acherlab.xyz" >> $env:GITHUB_ENV
 
-      # THÔNG TIN
+      # THÔNG TIN KẾT NỐI
       - name: 🎉 THÔNG TIN KẾT NỐI
         run: |
           $matKhau = Get-Content $env:TEMP\rdp_password.txt -ErrorAction SilentlyContinue
           if (-not $matKhau) { $matKhau = "Không đọc được" }
+          $remotePort = $env:FRP_PORT
+          $domain = $env:FRP_DOMAIN
           $durationInput = "${{ github.event.inputs.duration }}"
           switch ($durationInput) {
               "1h" { $totalMinutes = 60; $displayTime = "1 giờ" }
@@ -195,8 +206,8 @@ jobs:
           Write-Host "┌───────────────────────────────────────────┐" -ForegroundColor Cyan
           Write-Host "│         🎉 KẾT NỐI THÀNH CÔNG!            │" -ForegroundColor Cyan
           Write-Host "├───────────────────────────────────────────┤" -ForegroundColor Cyan
-          Write-Host "│ 🌐  Server: 103.82.195.149" -ForegroundColor White
-          Write-Host "│ 🔌  Port: (random, xem log frpc)" -ForegroundColor White
+          Write-Host "│ 🌐  Domain: $domain" -ForegroundColor White
+          Write-Host "│ 🔌  Port: $remotePort" -ForegroundColor White
           Write-Host "│ 👤  User: acherlab-user" -ForegroundColor White
           Write-Host "│ 🔐  Mật khẩu: $matKhau" -ForegroundColor White
           Write-Host "│ ⏰  Thời lượng: $displayTime" -ForegroundColor White
@@ -205,7 +216,7 @@ jobs:
           Write-Host "├───────────────────────────────────────────┤" -ForegroundColor Cyan
           Write-Host "│ 💡  Hướng dẫn:                            │" -ForegroundColor Cyan
           Write-Host "│   1. Mở Remote Desktop Connection        │" -ForegroundColor Yellow
-          Write-Host "│   2. Nhập IP: 103.82.195.149:port        │" -ForegroundColor Yellow
+          Write-Host "│   2. Nhập: $($domain):$remotePort        │" -ForegroundColor Yellow
           Write-Host "│   3. User: acherlab-user, Pass: trên     │" -ForegroundColor Yellow
           Write-Host "│   4. Enjoy! 🚀                           │" -ForegroundColor Yellow
           Write-Host "└───────────────────────────────────────────┘" -ForegroundColor Cyan
@@ -217,17 +228,18 @@ jobs:
           $matKhau = Get-Content $env:TEMP\rdp_password.txt -ErrorAction SilentlyContinue
           $totalMinutes = $env:TOTAL_MINUTES
           $frpPid = $env:FRP_PID
+          $remotePort = $env:FRP_PORT
+          $domain = $env:FRP_DOMAIN
           $timeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("SE Asia Standard Time")
           $thoiGianBatDau = [System.TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), $timeZone)
           $thoiGianKetThuc = $thoiGianBatDau.AddMinutes($totalMinutes)
           Write-Host ""
           Write-Host "🔄 DUY TRÌ PHIÊN..." -ForegroundColor Yellow
           Write-Host "💎 acherlab RDP" -ForegroundColor Magenta
-          Write-Host "🔗 Kết nối: 103.82.195.149 (port random)" -ForegroundColor Cyan
+          Write-Host "🔗 Kết nối: ${domain}:${remotePort}" -ForegroundColor Cyan
           Write-Host "🕐 Bắt đầu: $($thoiGianBatDau.ToString('HH:mm:ss'))" -ForegroundColor Green
           Write-Host "🕐 Kết thúc: $($thoiGianKetThuc.ToString('HH:mm:ss'))" -ForegroundColor Green
           Write-Host ""
-          # Monitor process
           $monitorScript = {
               param($frpPid)
               $lastLogTime = Get-Date
